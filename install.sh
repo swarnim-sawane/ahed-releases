@@ -101,6 +101,21 @@ main() {
   local zip="Ahed-${tag#alpha-}.zip"
   local release="${tag#alpha-}"
   local version="${release%-*}" build="${release##*-}"
+  # Private test builds can be ahead of the public feed. Re-running the public
+  # installer must not silently replace a newer local repair with an old release.
+  local installed_build="" installed_version=""
+  if [ "$existing" = true ]; then
+    installed_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist" 2>/dev/null || true)"
+    if [[ "$installed_build" =~ ^[0-9]{1,9}$ ]] && [[ "$build" =~ ^[0-9]{1,9}$ ]] \
+        && (( 10#$installed_build > 10#$build )); then
+      installed_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+      done_step "Keeping Ahed ${installed_version:-installed} (build $installed_build)"
+      note "Your installed version is newer than the public release."
+      note "Nothing was downloaded or replaced."
+      printf '\n'
+      return 0
+    fi
+  fi
   if [ "$existing" = true ]; then
     done_step "Updating Ahed to $version (build $build)"
   else

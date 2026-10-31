@@ -30,7 +30,8 @@ curl -fsSL https://raw.githubusercontent.com/swarnim-sawane/ahed-releases/main/i
 > No letters or dots appear while you type. This is normal.
 
 The installer shows a compact download percentage. If Ahed is already installed, it updates the
-app and preserves your account and settings.
+app and preserves your account and settings. If you have a newer test build, it keeps that version
+instead of replacing it with an older public release.
 
 These alpha builds are self-signed and not notarized. The installer removes the downloaded app's
 quarantine flag after checking its checksum; it never re-signs the app. You can
