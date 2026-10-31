@@ -14,8 +14,53 @@ main() {
   local apps="${AHED_INSTALL_DIR:-/Applications}"
   local app="$apps/Ahed.app"
 
-  step()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
-  fail() { printf '\033[31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+  # Presentation stays separate from the install steps. Redirected output must
+  # remain readable in logs; cursor control and colour are only for terminals.
+  local interactive=false pending=false
+  local green="" muted="" bold="" reset="" red=""
+  local tick="OK" dot=".." arrow="->|"
+  if [ -t 1 ] && [ -t 2 ] && [ "${TERM:-dumb}" != "dumb" ]; then
+    interactive=true
+    if [ -z "${NO_COLOR+x}" ]; then
+      green=$'\033[32m'; muted=$'\033[2m'; bold=$'\033[1m'
+      reset=$'\033[0m'; red=$'\033[31m'
+    fi
+  fi
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8*|*utf-8*|*UTF8*|*utf8*) tick="✓"; dot="·"; arrow="→|" ;;
+  esac
+
+  clear_status() {
+    if [ "$pending" = true ]; then
+      printf '\r\033[2K'
+      pending=false
+    fi
+  }
+  status() {
+    clear_status
+    if [ "$interactive" = true ]; then
+      printf '  %s%s%s  %s' "$muted" "$dot" "$reset" "$*"
+      pending=true
+    else
+      printf '  %s  %s\n' "$dot" "$*"
+    fi
+  }
+  done_step() {
+    clear_status
+    printf '  %s%s%s  %s\n' "$green" "$tick" "$reset" "$*"
+  }
+  note() { printf '     %s%s%s\n' "$muted" "$*" "$reset"; }
+  fail() {
+    clear_status
+    printf '\n  %s%sInstallation paused%s\n' "$red" "$bold" "$reset" >&2
+    printf '  %s\n\n' "$*" >&2
+    exit 1
+  }
+
+  local existing=false
+  [ ! -e "$app" ] || existing=true
+  printf '\n  %s%s ahed.%s\n' "$green$bold" "$arrow" "$reset"
+  printf '  %sA little closer to your next idea.%s\n\n' "$muted" "$reset"
 
   # 1. Check the Mac
   [ "$(uname -s)" = "Darwin" ] || fail "This installer only runs on a Mac."
@@ -25,7 +70,7 @@ main() {
   [ "$major" -ge 14 ] || fail "Ahed needs macOS 14 Sonoma or newer. This Mac has $(sw_vers -productVersion)."
 
   # 2. Find the latest release (GitHub redirects /latest to /tag/<tag>)
-  step "Finding the latest Ahed release..."
+  status "Finding the latest release..."
   local tag
   tag="${AHED_TAG:-}"
   if [ -z "$tag" ]; then
@@ -34,26 +79,39 @@ main() {
   fi
   case "$tag" in alpha-*) ;; *) fail "Unexpected release tag '$tag'." ;; esac
   local zip="Ahed-${tag#alpha-}.zip"
-  step "Latest is $tag"
+  local release="${tag#alpha-}"
+  local version="${release%-*}" build="${release##*-}"
+  if [ "$existing" = true ]; then
+    done_step "Updating Ahed to $version (build $build)"
+  else
+    done_step "Installing Ahed $version (build $build)"
+  fi
 
   # 3. Download and verify
   AHED_TMP="$(mktemp -d)"
   trap 'rm -rf "$AHED_TMP"' EXIT
   local tmp="$AHED_TMP"
-  step "Downloading $zip..."
-  curl -fL --progress-bar -o "$tmp/$zip" "$base/download/$tag/$zip" || fail "Download failed."
-  curl -fsSL -o "$tmp/SHA256SUMS.txt" "$base/download/$tag/SHA256SUMS.txt" || fail "Could not download checksums."
+  if [ "$interactive" = true ]; then
+    printf '  %sDownloading Ahed...%s\n' "$muted" "$reset"
+    COLUMNS=48 curl -fL --progress-bar -o "$tmp/$zip" "$base/download/$tag/$zip" || fail "Download interrupted. Check your connection and run the installer again."
+  else
+    status "Downloading Ahed..."
+    curl -fsSL -o "$tmp/$zip" "$base/download/$tag/$zip" || fail "Download interrupted. Check your connection and run the installer again."
+  fi
+  status "Checking the download..."
+  curl -fsSL -o "$tmp/SHA256SUMS.txt" "$base/download/$tag/SHA256SUMS.txt" || fail "Could not check the download. Please run the installer again."
 
   local expected actual
   expected="$(awk -v name="$zip" '$2 == name || $2 == "*" name { print $1; exit }' "$tmp/SHA256SUMS.txt")"
-  [ -n "$expected" ] || fail "$zip is not listed in SHA256SUMS.txt."
-  [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || fail "The release checksum is invalid."
+  [ -n "$expected" ] || fail "This release is missing its download checksum. Please contact ahed.vibe@gmail.com."
+  [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || fail "This release has an invalid download checksum. Please contact ahed.vibe@gmail.com."
   actual="$(shasum -a 256 "$tmp/$zip" | awk '{print $1}')"
   [ "$expected" = "$actual" ] || fail "Checksum mismatch, the download may be damaged. Please try again."
-  step "Checksum OK"
+  done_step "Download verified"
 
   # 4. Unpack
-  ditto -x -k "$tmp/$zip" "$tmp/unpacked"
+  status "Preparing the app..."
+  ditto -x -k "$tmp/$zip" "$tmp/unpacked" || fail "Could not unpack Ahed. Check that your Mac has enough free space, then try again."
   local new_app
   new_app="$(find "$tmp/unpacked" -maxdepth 2 -name 'Ahed.app' -type d | head -n1)"
   [ -n "$new_app" ] || fail "Ahed.app was not found inside $zip."
@@ -61,7 +119,7 @@ main() {
 
   # 5. Quit a running copy, then install
   if pgrep -x Ahed >/dev/null 2>&1; then
-    step "Quitting the running Ahed..."
+    status "Closing the previous Ahed..."
     osascript -e 'tell application "Ahed" to quit' >/dev/null 2>&1 || true
     local attempt
     for attempt in {1..10}; do
@@ -71,14 +129,20 @@ main() {
     if pgrep -x Ahed >/dev/null 2>&1; then
       fail "Ahed is still running. Quit it from its menu, then run the installer again."
     fi
+    done_step "Closed the previous Ahed"
   fi
 
   local sudo=""
   if [ ! -w "$apps" ] || { [ -e "$app" ] && [ ! -w "$app" ]; }; then
-    step "Your Mac password is needed to write to $apps."
+    clear_status
+    printf '\n'
+    note "macOS needs your password to install in $apps."
+    note "Nothing appears while you type. This is normal."
+    printf '\n'
     sudo="sudo"
+    sudo -v || fail "Authorization was cancelled. Your existing installation was not changed. Run the installer again when you are ready."
   fi
-  step "Installing to $app..."
+  status "Installing in $apps..."
   # Stage on the destination volume before touching the installed copy. Keep the
   # previous app until the new one has launched so a failed copy cannot erase it.
   local stage backup
@@ -111,14 +175,28 @@ main() {
   fi
 
   # 7. Open
-  step "Opening Ahed..."
+  if [ "$existing" = true ]; then
+    done_step "Ahed updated"
+  else
+    done_step "Ahed installed"
+  fi
+  status "Opening Ahed..."
   if ! open "$app"; then
     # Preserve both copies for manual recovery rather than deleting either one.
     fail "Ahed could not open. The new app is at $app; any previous copy is saved in $stage."
   fi
   $sudo rm -rf "$stage"
-  echo
-  step "Done. Follow Ahed's setup to allow Accessibility, Input Monitoring and Screen Recording."
+  done_step "Opened Ahed"
+  printf '\n'
+  if [ "$existing" = true ]; then
+    note "Your account and settings are preserved."
+    note "If setup is unfinished, continue in Ahed."
+  else
+    note "Your setup continues in the app."
+    note "Sign in, then allow Accessibility, Input Monitoring"
+    note "and Screen Recording when Ahed guides you."
+  fi
+  printf '\n'
 }
 
 main
