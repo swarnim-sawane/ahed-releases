@@ -10,7 +10,18 @@ matching corresponding source. Ahed's private development history and signing ke
 
 - Access is invite-only. Downloading the app does not grant online assistance.
 - Apple Silicon Mac, macOS 14 or later. These alpha builds are self-signed and not notarized.
-- Install Ahed in Applications using the normal macOS Open Anyway flow if prompted. Do not re-sign it.
+- Install with one command in Terminal (downloads the latest release, checks it, puts it in
+  Applications and opens it). It removes the downloaded app's quarantine flag because these
+  alpha builds are not notarized. It may ask for your Mac password to write to Applications.
+  Do not re-sign the app. You can [read the installer](install.sh) before running it.
+
+  ```
+  curl -fsSL https://raw.githubusercontent.com/swarnim-sawane/ahed-releases/main/install.sh | bash
+  ```
+
+  To install by hand instead, unzip the release into Applications, run
+  `xattr -dr com.apple.quarantine /Applications/Ahed.app`, then open it.
+- Follow setup to sign in and allow Accessibility, Input Monitoring and Screen Recording.
 - Existing builds without updates need one manual installation of an update-enabled build.
 - Later releases use signed downloads and ask before installation; there is no silent install.
 - Verify the downloaded file using its release's SHA256SUMS.txt and read README-FIRST.txt.
