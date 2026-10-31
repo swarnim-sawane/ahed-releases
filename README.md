@@ -19,8 +19,9 @@ matching corresponding source. Ahed's private development history and signing ke
   curl -fsSL https://raw.githubusercontent.com/swarnim-sawane/ahed-releases/main/install.sh | bash
   ```
 
-  The installer shows download and installation progress, detects existing installs and preserves
-  your account and settings. It uses plain output when redirected; set `NO_COLOR=1` to disable colour.
+  The installer shows compact download percentages and installation progress, detects existing
+  installs and preserves your account and settings. It uses plain output when redirected;
+  set `NO_COLOR=1` to disable colour.
   Nothing appears while typing your Mac password at the authorization prompt—this is normal.
 
   To install by hand instead, unzip the release into Applications, run

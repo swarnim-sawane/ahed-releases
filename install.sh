@@ -22,7 +22,9 @@ main() {
   if [ -t 1 ] && [ -t 2 ] && [ "${TERM:-dumb}" != "dumb" ]; then
     interactive=true
     if [ -z "${NO_COLOR+x}" ]; then
-      green=$'\033[32m'; muted=$'\033[2m'; bold=$'\033[1m'
+      # Keep guidance in the terminal's normal foreground. Faint/dim text can
+      # become unreadable on translucent themes and does not adapt to light ones.
+      green=$'\033[32m'; bold=$'\033[1m'
       reset=$'\033[0m'; red=$'\033[31m'
     fi
   fi
@@ -50,6 +52,24 @@ main() {
     printf '  %s%s%s  %s\n' "$green" "$tick" "$reset" "$*"
   }
   note() { printf '     %s%s%s\n' "$muted" "$*" "$reset"; }
+  download_progress() {
+    # curl supplies real transfer percentages separated by carriage returns.
+    # Render only those values, keeping its hash bar and technical stderr out of
+    # the UI. The enclosing pipefail still rejects any failed download. Unknown
+    # transfer sizes retain the honest "Downloading" status without a fake %.
+    local record="" percent="" previous=""
+    local percentage_pattern='([0-9]{1,3}([.][0-9]+)?)%'
+    while IFS= read -r -d $'\r' record || [ -n "$record" ]; do
+      if [[ $record =~ $percentage_pattern ]]; then
+        percent="${BASH_REMATCH[1]}"
+        if [ "$percent" != "$previous" ]; then
+          status "Downloading Ahed... $percent%"
+          previous="$percent"
+        fi
+      fi
+    done
+    return 0
+  }
   fail() {
     clear_status
     printf '\n  %s%sInstallation paused%s\n' "$red" "$bold" "$reset" >&2
@@ -91,11 +111,10 @@ main() {
   AHED_TMP="$(mktemp -d)"
   trap 'rm -rf "$AHED_TMP"' EXIT
   local tmp="$AHED_TMP"
+  status "Downloading Ahed..."
   if [ "$interactive" = true ]; then
-    printf '  %sDownloading Ahed...%s\n' "$muted" "$reset"
-    COLUMNS=48 curl -fL --progress-bar -o "$tmp/$zip" "$base/download/$tag/$zip" || fail "Download interrupted. Check your connection and run the installer again."
+    curl -fL --progress-bar -o "$tmp/$zip" "$base/download/$tag/$zip" 2>&1 | download_progress || fail "Download interrupted. Check your connection and run the installer again."
   else
-    status "Downloading Ahed..."
     curl -fsSL -o "$tmp/$zip" "$base/download/$tag/$zip" || fail "Download interrupted. Check your connection and run the installer again."
   fi
   status "Checking the download..."
