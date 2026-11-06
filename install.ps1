@@ -6,6 +6,45 @@
     $ProgressPreference = 'SilentlyContinue'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+    function Initialize-AhedPresentation {
+        # Redirected output and hosts such as ISE cannot safely rewrite a console
+        # line. Keep those transcripts plain, and never change the user's encoding.
+        $interactive = $false; $width = 80
+        try {
+            $interactive = $Host.Name -eq 'ConsoleHost' -and ![Console]::IsOutputRedirected -and $env:TERM -ne 'dumb'
+            if ($interactive) { $width = [Console]::WindowWidth; if ($width -lt 2) { $interactive = $false } }
+        } catch { $interactive = $false }
+        $unicode = $interactive -and ($env:WT_SESSION -or [Console]::OutputEncoding.CodePage -eq 65001)
+        $script:AhedPresentation = @{ Interactive=$interactive; Color=($interactive -and $null -eq $env:NO_COLOR);
+            Width=$width; Tick='OK'; Arrow='->|'; Pending=0; LastPercent=-1; LastSeconds=-10; SetupStarted=$false }
+        if ($unicode) { $script:AhedPresentation.Tick = [string][char]0x2713; $script:AhedPresentation.Arrow = ([string][char]0x2192) + '|' }
+    }
+    function Complete-AhedProgress {
+        if ($script:AhedPresentation -and $script:AhedPresentation.Pending -gt 0) {
+            Write-Host ''; $script:AhedPresentation.Pending = 0
+        }
+    }
+    function Write-AhedMessage([string]$Text, [string]$Kind = 'Note') {
+        if (!$script:AhedPresentation) { Initialize-AhedPresentation }
+        Complete-AhedProgress
+        $prefix = switch ($Kind) { 'Done' { $script:AhedPresentation.Tick }; 'Status' { '..' }; default { '  ' } }
+        $line = '  ' + $prefix + '  ' + $Text
+        if ($Kind -in @('Brand','Error')) { $line = '  ' + $Text }
+        if ($script:AhedPresentation.Color -and $Kind -in @('Done','Brand','Error')) {
+            $color = if ($Kind -eq 'Error') { 'Red' } else { 'Green' }
+            Write-Host $line -ForegroundColor $color
+        } else { Write-Host $line }
+    }
+    function Write-AhedFailure([string]$Message) {
+        Write-Host ''
+        Write-AhedMessage 'Installation paused' 'Error'
+        Write-AhedMessage $Message
+        if ($script:AhedPresentation.SetupStarted) {
+            Write-AhedMessage 'Setup was started, but completion could not be confirmed. Your saved account and settings were not reset.'
+        } else { Write-AhedMessage 'No installer was run. Your existing Ahed installation was kept.' }
+        Write-AhedMessage 'Check the message above, then run the same install command to try again.'
+        Write-Host ''
+    }
     function Get-AhedPinnedKey {
         'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE/bKtaJoFOcd5k8b5T81NqWtzNarddG1d2heqLHWUq3iC5D9tBsBlwVaxoS0Ue/ODTZwQ1KdJ+TioKT0qicyShA=='
     }
@@ -48,17 +87,21 @@
             $outputStream = if ($Destination) { [IO.File]::Create($Destination) } else { [IO.MemoryStream]::new() }
             $buffer = New-Object byte[] 65536; $total = [long]0
             $progressLength = if ($Expected -gt 0) { $Expected } elseif ($advertised -gt 0) { $advertised } else { 0 }
-            if ($showProgress) { Write-AhedDownloadProgress $total $progressLength; $lastProgress = $clock.ElapsedMilliseconds }
+            if ($showProgress) {
+                if (!$script:AhedPresentation) { Initialize-AhedPresentation }
+                $script:AhedPresentation.LastPercent = -1; $script:AhedPresentation.LastSeconds = -10
+                Write-AhedDownloadProgress $total $progressLength $clock.Elapsed.TotalSeconds; $lastProgress = $clock.ElapsedMilliseconds
+            }
             while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
                 $total += $read
                 if ($total -gt $Limit -or ($Expected -gt 0 -and $total -gt $Expected)) { throw 'Download exceeded its size limit.' }
                 $outputStream.Write($buffer, 0, $read)
                 if ($showProgress -and $clock.ElapsedMilliseconds - $lastProgress -ge 1000) {
-                    Write-AhedDownloadProgress $total $progressLength; $lastProgress = $clock.ElapsedMilliseconds
+                    Write-AhedDownloadProgress $total $progressLength $clock.Elapsed.TotalSeconds; $lastProgress = $clock.ElapsedMilliseconds
                 }
             }
             if ($total -eq 0 -or ($Expected -gt 0 -and $total -ne $Expected)) { throw 'Download was empty or incomplete.' }
-            if ($showProgress) { Write-AhedDownloadProgress $total $progressLength }
+            if ($showProgress) { Write-AhedDownloadProgress $total $progressLength $clock.Elapsed.TotalSeconds $true }
             if (!$Destination) { return ,$outputStream.ToArray() }
         }
         catch {
@@ -70,13 +113,43 @@
         }
         finally {
             if ($outputStream) { $outputStream.Dispose() }; if ($inputStream) { $inputStream.Dispose() }; if ($response) { $response.Dispose() }
-            if ($showProgress) { Write-Host '' }
+            if ($showProgress) { Complete-AhedProgress }
         }
     }
-    function Write-AhedDownloadProgress([long]$Bytes, [long]$Expected) {
-        $text = if ($Expected -gt 0) { 'Downloaded {0:N1} / {1:N1} MB' -f ($Bytes / 1000000.0), ($Expected / 1000000.0) }
-            else { 'Downloaded {0:N1} MB' -f ($Bytes / 1000000.0) }
-        Write-Host (("`r" + $text).PadRight(72)) -NoNewline
+    function Write-AhedDownloadProgress([long]$Bytes, [long]$Expected, [double]$Seconds = 0, [bool]$Complete = $false) {
+        if (!$script:AhedPresentation) { Initialize-AhedPresentation }
+        $ui = $script:AhedPresentation
+        $percent = if ($Expected -gt 0) { [Math]::Min(100, [Math]::Floor(100.0 * $Bytes / $Expected)) } else { -1 }
+        # An unknown transfer length has no honest percentage or ETA. Average
+        # throughput is feedback only; the transport still owns stall timeouts.
+        $text = if ($Expected -gt 0) { '{0,3}%  {1:N1} / {2:N1} MB' -f $percent, ($Bytes / 1000000.0), ($Expected / 1000000.0) }
+            else { '{0:N1} MB' -f ($Bytes / 1000000.0) }
+        $speed = if ($Seconds -gt 0) { $Bytes / $Seconds } else { 0 }
+        if ($speed -gt 0) {
+            $text += '  {0:N1} MB/s' -f ($speed / 1000000.0)
+            if ($Expected -gt $Bytes) {
+                $remaining = [Math]::Ceiling(($Expected - $Bytes) / $speed)
+                $text += '  ~{0}m {1:00}s left' -f [Math]::Floor($remaining / 60), ($remaining % 60)
+            }
+        } elseif ($Bytes -eq 0) { $text += '  waiting for data' }
+        if ($ui.Interactive) {
+            # Reserve the last column to avoid a console wrap leaving old progress
+            # behind. Narrow windows keep the numbers and omit the optional bar.
+            try { if ([Console]::WindowWidth -gt 1) { $ui.Width = [Console]::WindowWidth } } catch { }
+            $bar = ''
+            if ($percent -ge 0 -and $ui.Width -ge $text.Length + 28) {
+                $filled = [int][Math]::Floor($percent / 5)
+                $bar = '[' + ('=' * $filled) + (' ' * (20 - $filled)) + '] '
+            }
+            $line = '     ' + $bar + $text
+            $limit = [Math]::Max(1, $ui.Width - 1)
+            if ($line.Length -gt $limit) { $line = $line.Substring(0, $limit) }
+            Write-Host (("`r" + $line.PadRight([Math]::Min($limit, [Math]::Max($line.Length, $ui.Pending))))) -NoNewline
+            $ui.Pending = $line.Length
+        } elseif ($Complete -or $ui.LastSeconds -lt 0 -or ($percent -ge 0 -and [Math]::Floor($percent / 10) -gt [Math]::Floor($ui.LastPercent / 10)) -or $Seconds - $ui.LastSeconds -ge 10) {
+            Write-AhedMessage ('Downloading: ' + $text)
+            $ui.LastPercent = $percent; $ui.LastSeconds = $Seconds
+        }
     }
     function Get-AhedLatestRelease([string]$Xml, [bool]$AllowFile = $false, [bool]$CustomFeed = $false) {
         $Xml = $Xml.TrimStart([char]0xFEFF) # Windows PowerShell writes a UTF-8 BOM in local test feeds.
@@ -138,19 +211,25 @@
     }
     function Invoke-AhedSetup([string]$Path) {
         $process = Start-Process -FilePath $Path -ArgumentList '/S /relaunch' -WindowStyle Hidden -PassThru
+        $script:AhedPresentation.SetupStarted = $true
         # Start-Process -Wait also waits for the relaunched app. Wait for Setup alone.
         $process.WaitForExit(); $process.Refresh()
         if ($process.ExitCode -ne 0) { throw ('Ahed Setup stopped with code ' + $process.ExitCode + '. Your saved settings and sign-in were kept.') }
     }
     function Open-AhedInstalledApp([string]$Path) { Start-Process -FilePath $Path -WorkingDirectory (Split-Path $Path -Parent) -WindowStyle Hidden }
     function Invoke-AhedBootstrap {
+        Initialize-AhedPresentation
+        Write-Host ''
+        Write-AhedMessage ($script:AhedPresentation.Arrow + ' ahed.') 'Brand'
+        Write-Host '  A little closer to your next idea.'
+        Write-Host ''
         if ([Environment]::OSVersion.Platform -ne 'Win32NT' -or ![Environment]::Is64BitOperatingSystem) { throw 'Ahed needs 64-bit Windows 10 or 11.' }
         $os = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
         if ($os.CurrentMajorVersionNumber -lt 10) { throw 'Ahed needs Windows 10 or 11.' }
         $feedText = $env:AHED_UPDATE_FEED; $custom = ![string]::IsNullOrWhiteSpace($feedText)
         if (!$custom) { $feedText = 'https://github.com/swarnim-sawane/ahed-releases/releases/download/windows-feed/appcast-windows.xml' }
         $feedUri = [uri]$feedText; Assert-AhedUri $feedUri $custom; $allowFile = $custom -and $feedUri.IsFile
-        Write-Host 'Finding the latest Ahed for Windows...'
+        Write-AhedMessage 'Finding the latest Ahed for Windows...' 'Status'
         try { $xml = [Text.Encoding]::UTF8.GetString((Read-AhedResource $feedUri '' 1048576 0 $allowFile)) }
         catch { throw 'The Windows release feed could not be read. It may not be published yet. No installation was changed.' }
         $release = Get-AhedLatestRelease $xml $allowFile $custom
@@ -158,27 +237,50 @@
         $directory = Get-AhedInstallDirectory; $exe = Join-Path $directory 'Ahed.Windows.exe'; $installed = Get-AhedInstalledVersion $exe
         if ($installed -and $installed -ge $release.Version) {
             if (!(Test-Path -LiteralPath $exe)) { throw 'Ahed is registered at this or a newer version, but its executable is missing. Repair it with the same or a newer installer.' }
-            Write-Host ('Ahed ' + $installed + ' is already installed. No downgrade or reinstall is needed.'); Open-AhedInstalledApp $exe; return
+            Write-AhedMessage ('Ahed ' + $installed + ' is already installed. No downgrade or reinstall needed.') 'Done'
+            Write-AhedMessage 'Opening Ahed...' 'Status'; Open-AhedInstalledApp $exe
+            Write-AhedMessage 'Ahed opened.' 'Done'; Write-Host ''; return
         }
+        $action = if ($installed) { 'Updating Ahed from ' + $installed + ' to ' } else { 'Installing Ahed ' }
+        Write-AhedMessage ($action + $release.Version) 'Status'
+        Write-AhedMessage 'Installs for your Windows user. No administrator password needed.'
         $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()); $temp = Join-Path $tempRoot ('AhedInstall-' + [Guid]::NewGuid().ToString('N'))
         [IO.Directory]::CreateDirectory($temp) | Out-Null
         try {
             $setup = Join-Path $temp ('AhedSetup-' + $release.Version.ToString(3) + '.exe')
-            Write-Host ('Downloading Ahed ' + $release.Version + '...'); Read-AhedResource $release.Uri $setup 536870912 $release.Length $allowFile
+            Write-AhedMessage 'Downloading Ahed...' 'Status'; Read-AhedResource $release.Uri $setup 536870912 $release.Length $allowFile
+            Write-AhedMessage 'Download complete.' 'Done'
             $locked = [IO.File]::Open($setup, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
             try {
+                Write-AhedMessage 'Verifying download signature and version...' 'Status'
                 Test-AhedInstaller $locked $release.Signature $setup $release.Version
+                Write-AhedMessage 'Download verified.' 'Done'
                 $nowInstalled = Get-AhedInstalledVersion $exe
-                if ($nowInstalled -and $nowInstalled -ge $release.Version) { Write-Host 'Another installer already updated Ahed.'; return }
-                Write-Host 'Signature and version verified. Installing...'; Invoke-AhedSetup $setup
+                if ($nowInstalled -and $nowInstalled -ge $release.Version) { Write-AhedMessage 'Another installer already updated Ahed.' 'Done'; return }
+                Write-AhedMessage 'Installing and opening Ahed. This can take a moment...' 'Status'
+                Invoke-AhedSetup $setup
             } finally { $locked.Dispose() }
             if (!(Test-Path -LiteralPath $exe) -or (Get-AhedFileVersion $exe) -ne $release.Version) { throw 'Setup completed, but the installed version could not be confirmed.' }
-            Write-Host 'Done. Ahed is installed and has been opened. Existing settings, sign-in and device identity are kept.'
+            Write-AhedMessage ('Ahed ' + $release.Version + ' installed.') 'Done'
+            Write-AhedMessage 'Look for Ahed in your system tray.'
+            Write-AhedMessage 'Your settings, sign-in and device identity are kept.'
+            Write-Host ''
+            Write-AhedMessage 'A little more space to think.'
+            Write-Host ''
         }
         finally {
             $absolute = [IO.Path]::GetFullPath($temp)
             if ($absolute.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and [IO.Path]::GetFileName($absolute).StartsWith('AhedInstall-')) { Remove-Item -LiteralPath $absolute -Recurse -Force -ErrorAction SilentlyContinue }
         }
     }
-    Invoke-AhedBootstrap
+    function Invoke-AhedInstallFlow {
+        try { Invoke-AhedBootstrap }
+        catch {
+            Write-AhedFailure $_.Exception.Message
+            # Preserve a terminating error for callers and scripts. Never exit the
+            # user's interactive shell or turn a failed installation into success.
+            throw
+        }
+    }
+    Invoke-AhedInstallFlow
 }
