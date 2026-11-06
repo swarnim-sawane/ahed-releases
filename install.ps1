@@ -25,13 +25,16 @@
         Assert-AhedUri $Uri $AllowFile
         $response = $null; $inputStream = $null; $outputStream = $null
         $clock = [Diagnostics.Stopwatch]::StartNew()
+        $showProgress = $Destination -and !$Uri.IsFile; $lastProgress = [long]0
         try {
             if ($Uri.IsFile) { $inputStream = [IO.File]::OpenRead($Uri.LocalPath); $advertised = $inputStream.Length }
             else {
                 $current = $Uri
                 for ($redirect = 0; ; $redirect++) {
                     $request = [Net.HttpWebRequest]::Create($current)
-                    $request.AllowAutoRedirect = $false; $request.Timeout = 15000; $request.ReadWriteTimeout = 15000
+                    # Bound an unresponsive connection/read, not the total transfer. Large
+                    # signed installers can legitimately take longer than five minutes.
+                    $request.AllowAutoRedirect = $false; $request.Timeout = 120000; $request.ReadWriteTimeout = 120000
                     $request.UserAgent = 'Ahed-Windows-Installer'; $request.UseDefaultCredentials = $false
                     $response = $request.GetResponse()
                     if ([int]$response.StatusCode -notin @(301,302,303,307,308)) { break }
@@ -44,17 +47,36 @@
             if ($advertised -gt $Limit -or ($Expected -gt 0 -and $advertised -ge 0 -and $advertised -ne $Expected)) { throw 'Download size does not match the release.' }
             $outputStream = if ($Destination) { [IO.File]::Create($Destination) } else { [IO.MemoryStream]::new() }
             $buffer = New-Object byte[] 65536; $total = [long]0
+            $progressLength = if ($Expected -gt 0) { $Expected } elseif ($advertised -gt 0) { $advertised } else { 0 }
+            if ($showProgress) { Write-AhedDownloadProgress $total $progressLength; $lastProgress = $clock.ElapsedMilliseconds }
             while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
                 $total += $read
-                if ($total -gt $Limit -or ($Expected -gt 0 -and $total -gt $Expected) -or $clock.Elapsed.TotalSeconds -gt 300) { throw 'Download exceeded its size or time limit.' }
+                if ($total -gt $Limit -or ($Expected -gt 0 -and $total -gt $Expected)) { throw 'Download exceeded its size limit.' }
                 $outputStream.Write($buffer, 0, $read)
+                if ($showProgress -and $clock.ElapsedMilliseconds - $lastProgress -ge 1000) {
+                    Write-AhedDownloadProgress $total $progressLength; $lastProgress = $clock.ElapsedMilliseconds
+                }
             }
             if ($total -eq 0 -or ($Expected -gt 0 -and $total -ne $Expected)) { throw 'Download was empty or incomplete.' }
+            if ($showProgress) { Write-AhedDownloadProgress $total $progressLength }
             if (!$Destination) { return ,$outputStream.ToArray() }
+        }
+        catch {
+            $cause = $_.Exception.GetBaseException()
+            if ($cause -is [Net.WebException] -and $cause.Status -eq [Net.WebExceptionStatus]::Timeout) {
+                throw 'The download made no progress for two minutes. Run the same install command to try again. No installer was run.'
+            }
+            throw
         }
         finally {
             if ($outputStream) { $outputStream.Dispose() }; if ($inputStream) { $inputStream.Dispose() }; if ($response) { $response.Dispose() }
+            if ($showProgress) { Write-Host '' }
         }
+    }
+    function Write-AhedDownloadProgress([long]$Bytes, [long]$Expected) {
+        $text = if ($Expected -gt 0) { 'Downloaded {0:N1} / {1:N1} MB' -f ($Bytes / 1000000.0), ($Expected / 1000000.0) }
+            else { 'Downloaded {0:N1} MB' -f ($Bytes / 1000000.0) }
+        Write-Host (("`r" + $text).PadRight(72)) -NoNewline
     }
     function Get-AhedLatestRelease([string]$Xml, [bool]$AllowFile = $false, [bool]$CustomFeed = $false) {
         $Xml = $Xml.TrimStart([char]0xFEFF) # Windows PowerShell writes a UTF-8 BOM in local test feeds.
